@@ -152,6 +152,18 @@
             background: linear-gradient(90deg, #00d4ff, #9d4edd);
         }
 
+        .wifi-metric .metric-bar-fill {
+            background: linear-gradient(90deg, #00ff88, #ffaa00);
+        }
+
+        .infrasound-metric .metric-bar-fill {
+            background: linear-gradient(90deg, #ff006e, #ff6b6b);
+        }
+
+        .confidence-metric .metric-bar-fill {
+            background: linear-gradient(90deg, #00ff88, #00d4ff);
+        }
+
         .controls {
             display: flex;
             gap: 15px;
@@ -292,24 +304,37 @@
 
         <div class="metrics">
             <div class="metric sonar-metric">
-                <div class="metric-label">ULTRASONIC REFLECTION</div>
+                <div class="metric-label">ULTRASONIC (20kHz)</div>
                 <div class="metric-value" id="sonarValue">0.00</div>
                 <div class="metric-bar">
                     <div class="metric-bar-fill" id="sonarBar" style="width: 0%"></div>
                 </div>
             </div>
-            <div class="metric">
-                <div class="metric-label">MOVEMENT INDEX</div>
-                <div class="metric-value" id="movementValue">0.00</div>
+            <div class="metric infrasound-metric">
+                <div class="metric-label">INFRASOUND (Breathing)</div>
+                <div class="metric-value" id="infraValue">0.00</div>
                 <div class="metric-bar">
-                    <div class="metric-bar-fill" id="movementBar" style="width: 0%"></div>
+                    <div class="metric-bar-fill" id="infraBar" style="width: 0%"></div>
+                </div>
+            </div>
+            <div class="metric wifi-metric">
+                <div class="metric-label">NETWORK RTT (ms)</div>
+                <div class="metric-value" id="rttValue">--</div>
+                <div class="metric-bar">
+                    <div class="metric-bar-fill" id="rttBar" style="width: 0%"></div>
+                </div>
+            </div>
+            <div class="metric confidence-metric">
+                <div class="metric-label">PRESENCE CONFIDENCE</div>
+                <div class="metric-value" id="confidenceValue">0%</div>
+                <div class="metric-bar">
+                    <div class="metric-bar-fill" id="confidenceBar" style="width: 0%"></div>
                 </div>
             </div>
         </div>
 
         <div class="controls">
             <button class="btn btn-primary" id="startBtn">Start Detection</button>
-            <button class="btn btn-secondary" id="calibrateBtn" disabled>Calibrate</button>
         </div>
 
         <div class="log" id="log">
@@ -317,9 +342,10 @@
         </div>
 
         <div class="info">
-            <strong>How it works:</strong> Your laptop speaker emits an inaudible 20kHz tone. 
-            The microphone listens for reflections. When a human is present, the acoustic 
-            signature changes - just like a bat using echolocation. No camera. No video. Pure sound magic.
+            <strong>Three invisible signals, one laptop:</strong><br><br>
+            🦇 <strong>Ultrasonic (20kHz)</strong> - Echolocation. Speaker emits inaudible tone, mic detects body reflections.<br><br>
+            🫁 <strong>Infrasound (&lt;20Hz)</strong> - Breathing detection. Your breath creates air pressure waves the mic can sense.<br><br>
+            📡 <strong>Network RTT</strong> - WiFi fluctuation. Your body affects signal path to router.
         </div>
     </div>
 
@@ -328,34 +354,51 @@
         const ULTRASONIC_FREQ = 20000; // 20kHz - inaudible to most humans
         const SAMPLE_RATE = 44100;
         const FFT_SIZE = 2048;
-        const DETECTION_THRESHOLD = 0.15;
+        const DETECTION_THRESHOLD = 0.25; // Increased threshold
         const CALIBRATION_SAMPLES = 30;
+        const STABILITY_BUFFER = 15; // Number of consistent readings before changing state
+        const SMOOTHING_WINDOW = 10; // Rolling average window
 
         // State
         let audioContext;
         let oscillator;
-        let analyser;
+        let analyserUltrasonic;
+        let analyserInfrasound;
         let microphone;
         let isRunning = false;
         let calibrationBaseline = null;
+        let infraBaseline = null;
         let calibrationSamples = [];
+        let infraCalibrationSamples = [];
         let isCalibrating = false;
         let presenceHistory = [];
         let lastPresenceState = null;
+        let stabilityCounter = 0;
+        let confirmedState = null;
+        let energyBuffer = [];
+        let infraBuffer = [];
 
         // DOM elements
         const startBtn = document.getElementById('startBtn');
-        const calibrateBtn = document.getElementById('calibrateBtn');
         const statusRing = document.getElementById('statusRing');
         const statusIcon = document.getElementById('statusIcon');
         const statusText = document.getElementById('statusText');
         const sonarValue = document.getElementById('sonarValue');
         const sonarBar = document.getElementById('sonarBar');
-        const movementValue = document.getElementById('movementValue');
-        const movementBar = document.getElementById('movementBar');
+        const infraValue = document.getElementById('infraValue');
+        const infraBar = document.getElementById('infraBar');
+        const rttValue = document.getElementById('rttValue');
+        const rttBar = document.getElementById('rttBar');
+        const confidenceValue = document.getElementById('confidenceValue');
+        const confidenceBar = document.getElementById('confidenceBar');
         const logEl = document.getElementById('log');
         const visualizer = document.getElementById('visualizer');
         const sonarPulse = document.getElementById('sonarPulse');
+
+        // Network monitoring
+        let networkConnection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        let rttHistory = [];
+        let rttBaseline = null;
 
         // Create visualizer bars
         for (let i = 0; i < 32; i++) {
@@ -395,18 +438,40 @@
                 // Set up microphone input
                 microphone = audioContext.createMediaStreamSource(stream);
                 
-                // Set up analyser
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = FFT_SIZE;
-                analyser.smoothingTimeConstant = 0.3;
-                microphone.connect(analyser);
+                // Ultrasonic analyser (high frequencies)
+                analyserUltrasonic = audioContext.createAnalyser();
+                analyserUltrasonic.fftSize = FFT_SIZE;
+                analyserUltrasonic.smoothingTimeConstant = 0.3;
+                
+                // Infrasound analyser (low frequencies - breathing detection)
+                analyserInfrasound = audioContext.createAnalyser();
+                analyserInfrasound.fftSize = 8192; // Larger FFT for low freq resolution
+                analyserInfrasound.smoothingTimeConstant = 0.8;
+                
+                // Low-pass filter for infrasound (only let through < 20Hz)
+                const lowpassFilter = audioContext.createBiquadFilter();
+                lowpassFilter.type = 'lowpass';
+                lowpassFilter.frequency.setValueAtTime(30, audioContext.currentTime);
+                lowpassFilter.Q.setValueAtTime(1, audioContext.currentTime);
+                
+                // High-pass filter for ultrasonic (only let through > 18kHz)
+                const highpassFilter = audioContext.createBiquadFilter();
+                highpassFilter.type = 'highpass';
+                highpassFilter.frequency.setValueAtTime(18000, audioContext.currentTime);
+                
+                // Connect microphone to both analysers with filters
+                microphone.connect(highpassFilter);
+                highpassFilter.connect(analyserUltrasonic);
+                
+                microphone.connect(lowpassFilter);
+                lowpassFilter.connect(analyserInfrasound);
 
                 // Create ultrasonic oscillator
                 oscillator = audioContext.createOscillator();
                 oscillator.type = 'sine';
                 oscillator.frequency.setValueAtTime(ULTRASONIC_FREQ, audioContext.currentTime);
                 
-                // Create gain node to control volume (keep it low)
+                // Create gain node to control volume
                 const gainNode = audioContext.createGain();
                 gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
                 
@@ -415,8 +480,9 @@
                 
                 oscillator.start();
 
-                log('Ultrasonic emitter started at 20kHz', 'event');
-                log('Microphone active - listening for reflections', 'event');
+                log('🦇 Ultrasonic emitter active (20kHz)', 'event');
+                log('🫁 Infrasound listener active (<20Hz)', 'event');
+                log('📡 Network monitoring active', 'event');
 
                 return true;
             } catch (err) {
@@ -437,9 +503,9 @@
         }
 
         function getUltrasonicEnergy() {
-            const bufferLength = analyser.frequencyBinCount;
+            const bufferLength = analyserUltrasonic.frequencyBinCount;
             const dataArray = new Float32Array(bufferLength);
-            analyser.getFloatFrequencyData(dataArray);
+            analyserUltrasonic.getFloatFrequencyData(dataArray);
 
             // Find the bin corresponding to our ultrasonic frequency
             const binHz = SAMPLE_RATE / FFT_SIZE;
@@ -459,10 +525,32 @@
             return energy / (range * 2 + 1);
         }
 
+        function getInfrasoundEnergy() {
+            const bufferLength = analyserInfrasound.frequencyBinCount;
+            const dataArray = new Float32Array(bufferLength);
+            analyserInfrasound.getFloatFrequencyData(dataArray);
+
+            // Breathing is typically 0.2-0.5 Hz (12-30 breaths per minute)
+            // But we'll look at the 0.1-5 Hz range for general low-freq activity
+            const binHz = SAMPLE_RATE / 8192;
+            const minBin = Math.floor(0.1 / binHz);
+            const maxBin = Math.ceil(10 / binHz); // Up to 10Hz
+            
+            let energy = 0;
+            let count = 0;
+            for (let i = minBin; i <= maxBin && i < bufferLength; i++) {
+                const linear = Math.pow(10, dataArray[i] / 20);
+                energy += linear;
+                count++;
+            }
+            
+            return count > 0 ? energy / count : 0;
+        }
+
         function getFullSpectrum() {
-            const bufferLength = analyser.frequencyBinCount;
+            const bufferLength = analyserUltrasonic.frequencyBinCount;
             const dataArray = new Uint8Array(bufferLength);
-            analyser.getByteFrequencyData(dataArray);
+            analyserUltrasonic.getByteFrequencyData(dataArray);
             return dataArray;
         }
 
@@ -475,108 +563,105 @@
             });
         }
 
-        function calibrate() {
-            if (!isRunning) return;
-            
-            isCalibrating = true;
-            calibrationSamples = [];
-            calibrateBtn.disabled = true;
-            log('Calibrating... please step away from laptop', 'warning');
-            statusText.textContent = 'CALIBRATING';
-            statusIcon.textContent = '📡';
-            
-            const calibrationInterval = setInterval(() => {
-                const energy = getUltrasonicEnergy();
-                calibrationSamples.push(energy);
-                
-                if (calibrationSamples.length >= CALIBRATION_SAMPLES) {
-                    clearInterval(calibrationInterval);
-                    
-                    // Calculate baseline (average of samples)
-                    calibrationBaseline = calibrationSamples.reduce((a, b) => a + b, 0) / calibrationSamples.length;
-                    
-                    // Calculate standard deviation for threshold
-                    const variance = calibrationSamples.reduce((sum, val) => sum + Math.pow(val - calibrationBaseline, 2), 0) / calibrationSamples.length;
-                    const stdDev = Math.sqrt(variance);
-                    
-                    log(`Calibration complete. Baseline: ${calibrationBaseline.toFixed(4)}`, 'event');
-                    log(`Standard deviation: ${stdDev.toFixed(4)}`, 'event');
-                    
-                    isCalibrating = false;
-                    calibrateBtn.disabled = false;
-                }
-            }, 100);
-        }
-
         function detectPresence() {
             if (!isRunning || isCalibrating) return;
 
-            const energy = getUltrasonicEnergy();
+            // Get all three signals
+            const ultraEnergy = getUltrasonicEnergy();
+            const infraEnergy = getInfrasoundEnergy();
             const spectrum = getFullSpectrum();
             
             updateVisualizer(spectrum);
 
-            // Calculate movement index based on spectral flux
-            let movement = 0;
-            if (presenceHistory.length > 0) {
-                const lastEnergy = presenceHistory[presenceHistory.length - 1];
-                movement = Math.abs(energy - lastEnergy) * 100;
+            // Smooth the readings
+            energyBuffer.push(ultraEnergy);
+            if (energyBuffer.length > SMOOTHING_WINDOW) energyBuffer.shift();
+            const smoothedUltra = energyBuffer.reduce((a, b) => a + b, 0) / energyBuffer.length;
+
+            infraBuffer.push(infraEnergy);
+            if (infraBuffer.length > SMOOTHING_WINDOW) infraBuffer.shift();
+            const smoothedInfra = infraBuffer.reduce((a, b) => a + b, 0) / infraBuffer.length;
+
+            // Auto-calibrate baselines (first 3 seconds)
+            if (calibrationBaseline === null && energyBuffer.length >= SMOOTHING_WINDOW) {
+                calibrationBaseline = smoothedUltra;
+                log('🦇 Ultrasonic baseline set', 'event');
             }
-            
-            // Store history
-            presenceHistory.push(energy);
-            if (presenceHistory.length > 30) {
-                presenceHistory.shift();
+            if (infraBaseline === null && infraBuffer.length >= SMOOTHING_WINDOW) {
+                infraBaseline = smoothedInfra;
+                log('🫁 Infrasound baseline set', 'event');
             }
 
-            // Calculate variance in recent samples
-            const recentAvg = presenceHistory.reduce((a, b) => a + b, 0) / presenceHistory.length;
-            const recentVariance = presenceHistory.reduce((sum, val) => sum + Math.pow(val - recentAvg, 2), 0) / presenceHistory.length;
-            
-            // Determine presence
-            let isPresent = false;
-            let confidence = 0;
-            
-            if (calibrationBaseline !== null) {
-                // Compare against calibrated baseline
-                const deviation = Math.abs(energy - calibrationBaseline) / calibrationBaseline;
-                confidence = Math.min(1, deviation * 5);
-                isPresent = deviation > DETECTION_THRESHOLD || recentVariance > 0.0001;
+            // Calculate deviations from baseline
+            let ultraScore = 0;
+            let infraScore = 0;
+            let networkScore = 0;
+
+            if (calibrationBaseline !== null && calibrationBaseline > 0) {
+                const ultraDeviation = Math.abs(smoothedUltra - calibrationBaseline) / calibrationBaseline;
+                ultraScore = Math.min(1, ultraDeviation * 3);
+            }
+
+            if (infraBaseline !== null && infraBaseline > 0) {
+                const infraDeviation = Math.abs(smoothedInfra - infraBaseline) / infraBaseline;
+                // Infrasound is more sensitive to breathing/movement
+                infraScore = Math.min(1, infraDeviation * 2);
+            }
+
+            // Network score from RTT variance
+            if (rttHistory.length > 5) {
+                const avgRtt = rttHistory.reduce((a, b) => a + b, 0) / rttHistory.length;
+                const rttVariance = rttHistory.reduce((sum, val) => sum + Math.pow(val - avgRtt, 2), 0) / rttHistory.length;
+                networkScore = Math.min(1, rttVariance / 100);
+            }
+
+            // Combined confidence score (weighted average)
+            const confidence = (ultraScore * 0.4) + (infraScore * 0.4) + (networkScore * 0.2);
+            const isPresent = confidence > 0.15;
+
+            // Stability logic
+            if (confirmedState === null) {
+                confirmedState = isPresent;
+                stabilityCounter = STABILITY_BUFFER;
+            } else if (isPresent !== confirmedState) {
+                stabilityCounter++;
+                if (stabilityCounter >= STABILITY_BUFFER) {
+                    confirmedState = isPresent;
+                    stabilityCounter = 0;
+                }
             } else {
-                // Without calibration, use movement and energy thresholds
-                confidence = Math.min(1, (movement * 2) + (recentVariance * 1000));
-                isPresent = confidence > 0.3;
+                stabilityCounter = Math.max(0, stabilityCounter - 1);
             }
 
             // Update UI
-            const normalizedEnergy = Math.min(1, energy * 10);
-            sonarValue.textContent = energy.toFixed(4);
-            sonarBar.style.width = `${normalizedEnergy * 100}%`;
+            sonarValue.textContent = smoothedUltra.toFixed(4);
+            sonarBar.style.width = `${Math.min(100, ultraScore * 100)}%`;
             
-            movementValue.textContent = movement.toFixed(2);
-            movementBar.style.width = `${Math.min(100, movement * 200)}%`;
+            infraValue.textContent = smoothedInfra.toFixed(4);
+            infraBar.style.width = `${Math.min(100, infraScore * 100)}%`;
 
-            // Update status
-            statusRing.className = 'status-ring detecting';
+            confidenceValue.textContent = `${Math.round(confidence * 100)}%`;
+            confidenceBar.style.width = `${Math.min(100, confidence * 100)}%`;
+
+            // Update status based on confirmed state
+            statusRing.className = 'status-ring';
             
-            if (isPresent) {
-                statusRing.classList.remove('detecting');
+            if (confirmedState) {
                 statusRing.classList.add('present');
                 statusIcon.textContent = '👤';
                 statusText.textContent = 'PRESENT';
                 
                 if (lastPresenceState !== true) {
-                    log('Human presence detected', 'event');
+                    log('✓ Human presence detected', 'event');
                     lastPresenceState = true;
                 }
             } else {
-                statusRing.classList.remove('detecting');
                 statusRing.classList.add('away');
                 statusIcon.textContent = '👻';
                 statusText.textContent = 'AWAY';
                 
                 if (lastPresenceState !== false) {
-                    log('No presence detected', 'warning');
+                    log('✗ No presence detected', 'warning');
                     lastPresenceState = false;
                 }
             }
@@ -591,12 +676,18 @@
                 clearInterval(detectionLoop);
                 stopAudio();
                 startBtn.textContent = 'Start Detection';
-                calibrateBtn.disabled = true;
                 statusRing.className = 'status-ring';
                 statusIcon.textContent = '👻';
                 statusText.textContent = 'STOPPED';
                 sonarPulse.classList.add('hidden');
                 log('Detection stopped');
+                
+                // Reset state
+                calibrationBaseline = null;
+                infraBaseline = null;
+                confirmedState = null;
+                energyBuffer = [];
+                infraBuffer = [];
                 return;
             }
 
@@ -610,23 +701,16 @@
                 isRunning = true;
                 startBtn.textContent = 'Stop Detection';
                 startBtn.disabled = false;
-                calibrateBtn.disabled = false;
                 statusRing.className = 'status-ring detecting';
-                statusText.textContent = 'DETECTING';
+                statusText.textContent = 'CALIBRATING';
+                statusIcon.textContent = '📡';
                 sonarPulse.classList.remove('hidden');
                 
-                log('Detection started - move around to see changes', 'event');
+                log('Initializing sensors...', 'event');
+                log('Auto-calibrating (stay still for 3 sec)...', 'warning');
                 
                 // Start detection loop
                 detectionLoop = setInterval(detectPresence, 50);
-                
-                // Auto-calibrate after 3 seconds
-                setTimeout(() => {
-                    if (isRunning && calibrationBaseline === null) {
-                        log('Auto-calibrating in 3 seconds... step away from laptop', 'warning');
-                        setTimeout(calibrate, 3000);
-                    }
-                }, 2000);
             } else {
                 startBtn.textContent = 'Start Detection';
                 startBtn.disabled = false;
@@ -634,12 +718,40 @@
         }
 
         startBtn.addEventListener('click', start);
-        calibrateBtn.addEventListener('click', calibrate);
 
         // Check for AudioContext support
         if (!window.AudioContext && !window.webkitAudioContext) {
             log('Your browser does not support Web Audio API', 'warning');
             startBtn.disabled = true;
+        }
+
+        // Network Information API monitoring
+        function updateNetworkInfo() {
+            if (networkConnection) {
+                const rtt = networkConnection.rtt;
+                
+                if (rtt !== undefined) {
+                    rttHistory.push(rtt);
+                    if (rttHistory.length > 20) rttHistory.shift();
+                    
+                    rttValue.textContent = rtt;
+                    rttBar.style.width = `${Math.min(100, (1 - rtt / 500) * 100)}%`;
+                }
+            } else {
+                rttValue.textContent = 'N/A';
+            }
+        }
+
+        // Update network info periodically
+        setInterval(updateNetworkInfo, 500);
+        updateNetworkInfo();
+
+        // Listen for network changes
+        if (networkConnection) {
+            networkConnection.addEventListener('change', () => {
+                log(`📡 Network: ${networkConnection.effectiveType}, RTT: ${networkConnection.rtt}ms`, 'event');
+                updateNetworkInfo();
+            });
         }
     </script>
 </body>
