@@ -354,10 +354,10 @@
         const ULTRASONIC_FREQ = 20000; // 20kHz - inaudible to most humans
         const SAMPLE_RATE = 44100;
         const FFT_SIZE = 2048;
-        const DETECTION_THRESHOLD = 0.25; // Increased threshold
+        const DETECTION_THRESHOLD = 0.25;
         const CALIBRATION_SAMPLES = 30;
-        const STABILITY_BUFFER = 15; // Number of consistent readings before changing state
-        const SMOOTHING_WINDOW = 10; // Rolling average window
+        const STABILITY_BUFFER = 8; // Faster response
+        const SMOOTHING_WINDOW = 5; // Less smoothing for faster updates
 
         // State
         let audioContext;
@@ -441,30 +441,16 @@
                 // Ultrasonic analyser (high frequencies)
                 analyserUltrasonic = audioContext.createAnalyser();
                 analyserUltrasonic.fftSize = FFT_SIZE;
-                analyserUltrasonic.smoothingTimeConstant = 0.3;
+                analyserUltrasonic.smoothingTimeConstant = 0.5;
                 
-                // Infrasound analyser (low frequencies - breathing detection)
+                // Infrasound analyser - actually just low frequency ambient sound
                 analyserInfrasound = audioContext.createAnalyser();
-                analyserInfrasound.fftSize = 8192; // Larger FFT for low freq resolution
-                analyserInfrasound.smoothingTimeConstant = 0.8;
+                analyserInfrasound.fftSize = 4096;
+                analyserInfrasound.smoothingTimeConstant = 0.7;
                 
-                // Low-pass filter for infrasound (only let through < 20Hz)
-                const lowpassFilter = audioContext.createBiquadFilter();
-                lowpassFilter.type = 'lowpass';
-                lowpassFilter.frequency.setValueAtTime(30, audioContext.currentTime);
-                lowpassFilter.Q.setValueAtTime(1, audioContext.currentTime);
-                
-                // High-pass filter for ultrasonic (only let through > 18kHz)
-                const highpassFilter = audioContext.createBiquadFilter();
-                highpassFilter.type = 'highpass';
-                highpassFilter.frequency.setValueAtTime(18000, audioContext.currentTime);
-                
-                // Connect microphone to both analysers with filters
-                microphone.connect(highpassFilter);
-                highpassFilter.connect(analyserUltrasonic);
-                
-                microphone.connect(lowpassFilter);
-                lowpassFilter.connect(analyserInfrasound);
+                // Connect microphone directly to both analysers (no filters - they were killing signal)
+                microphone.connect(analyserUltrasonic);
+                microphone.connect(analyserInfrasound);
 
                 // Create ultrasonic oscillator
                 oscillator = audioContext.createOscillator();
@@ -473,7 +459,7 @@
                 
                 // Create gain node to control volume
                 const gainNode = audioContext.createGain();
-                gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+                gainNode.gain.setValueAtTime(0.15, audioContext.currentTime);
                 
                 oscillator.connect(gainNode);
                 gainNode.connect(audioContext.destination);
@@ -530,16 +516,15 @@
             const dataArray = new Float32Array(bufferLength);
             analyserInfrasound.getFloatFrequencyData(dataArray);
 
-            // Breathing is typically 0.2-0.5 Hz (12-30 breaths per minute)
-            // But we'll look at the 0.1-5 Hz range for general low-freq activity
-            const binHz = SAMPLE_RATE / 8192;
-            const minBin = Math.floor(0.1 / binHz);
-            const maxBin = Math.ceil(10 / binHz); // Up to 10Hz
+            // Look at low frequencies 20-200Hz (room rumble, movement, breathing harmonics)
+            const binHz = SAMPLE_RATE / 4096;
+            const minBin = Math.floor(20 / binHz);
+            const maxBin = Math.ceil(200 / binHz);
             
             let energy = 0;
             let count = 0;
             for (let i = minBin; i <= maxBin && i < bufferLength; i++) {
-                const linear = Math.pow(10, dataArray[i] / 20);
+                const linear = Math.pow(10, (dataArray[i] + 100) / 40); // Adjusted scaling
                 energy += linear;
                 count++;
             }
@@ -564,7 +549,7 @@
         }
 
         function detectPresence() {
-            if (!isRunning || isCalibrating) return;
+            if (!isRunning) return;
 
             // Get all three signals
             const ultraEnergy = getUltrasonicEnergy();
@@ -573,7 +558,7 @@
             
             updateVisualizer(spectrum);
 
-            // Smooth the readings
+            // Store current readings
             energyBuffer.push(ultraEnergy);
             if (energyBuffer.length > SMOOTHING_WINDOW) energyBuffer.shift();
             const smoothedUltra = energyBuffer.reduce((a, b) => a + b, 0) / energyBuffer.length;
@@ -582,47 +567,48 @@
             if (infraBuffer.length > SMOOTHING_WINDOW) infraBuffer.shift();
             const smoothedInfra = infraBuffer.reduce((a, b) => a + b, 0) / infraBuffer.length;
 
-            // Auto-calibrate baselines (first 3 seconds)
+            // Auto-calibrate baselines after collecting enough samples
             if (calibrationBaseline === null && energyBuffer.length >= SMOOTHING_WINDOW) {
                 calibrationBaseline = smoothedUltra;
-                log('🦇 Ultrasonic baseline set', 'event');
+                log('🦇 Ultrasonic baseline: ' + calibrationBaseline.toFixed(4), 'event');
             }
             if (infraBaseline === null && infraBuffer.length >= SMOOTHING_WINDOW) {
                 infraBaseline = smoothedInfra;
-                log('🫁 Infrasound baseline set', 'event');
+                log('🫁 Infrasound baseline: ' + infraBaseline.toFixed(4), 'event');
             }
 
-            // Calculate deviations from baseline
+            // Calculate scores based on CHANGE from baseline
             let ultraScore = 0;
             let infraScore = 0;
             let networkScore = 0;
 
-            if (calibrationBaseline !== null && calibrationBaseline > 0) {
-                const ultraDeviation = Math.abs(smoothedUltra - calibrationBaseline) / calibrationBaseline;
-                ultraScore = Math.min(1, ultraDeviation * 3);
+            if (calibrationBaseline !== null) {
+                // Ultrasonic: detect change in reflection
+                const ultraChange = Math.abs(smoothedUltra - calibrationBaseline);
+                ultraScore = Math.min(1, ultraChange * 50);
             }
 
-            if (infraBaseline !== null && infraBaseline > 0) {
-                const infraDeviation = Math.abs(smoothedInfra - infraBaseline) / infraBaseline;
-                // Infrasound is more sensitive to breathing/movement
-                infraScore = Math.min(1, infraDeviation * 2);
+            if (infraBaseline !== null) {
+                // Infrasound: detect ambient sound changes (body absorbs sound)
+                const infraChange = Math.abs(smoothedInfra - infraBaseline);
+                infraScore = Math.min(1, infraChange * 10);
             }
 
-            // Network score from RTT variance
-            if (rttHistory.length > 5) {
+            // Network: RTT variance indicates movement
+            if (rttHistory.length > 3) {
                 const avgRtt = rttHistory.reduce((a, b) => a + b, 0) / rttHistory.length;
                 const rttVariance = rttHistory.reduce((sum, val) => sum + Math.pow(val - avgRtt, 2), 0) / rttHistory.length;
-                networkScore = Math.min(1, rttVariance / 100);
+                networkScore = Math.min(1, Math.sqrt(rttVariance) / 20);
             }
 
-            // Combined confidence score (weighted average)
-            const confidence = (ultraScore * 0.4) + (infraScore * 0.4) + (networkScore * 0.2);
-            const isPresent = confidence > 0.15;
+            // Combined confidence - any signal can trigger presence
+            const confidence = Math.max(ultraScore, infraScore, networkScore * 0.5);
+            const isPresent = confidence > 0.08;
 
-            // Stability logic
+            // Stability logic - faster response
             if (confirmedState === null) {
                 confirmedState = isPresent;
-                stabilityCounter = STABILITY_BUFFER;
+                stabilityCounter = 0;
             } else if (isPresent !== confirmedState) {
                 stabilityCounter++;
                 if (stabilityCounter >= STABILITY_BUFFER) {
@@ -637,13 +623,14 @@
             sonarValue.textContent = smoothedUltra.toFixed(4);
             sonarBar.style.width = `${Math.min(100, ultraScore * 100)}%`;
             
-            infraValue.textContent = smoothedInfra.toFixed(4);
+            infraValue.textContent = smoothedInfra.toFixed(2);
             infraBar.style.width = `${Math.min(100, infraScore * 100)}%`;
 
-            confidenceValue.textContent = `${Math.round(confidence * 100)}%`;
-            confidenceBar.style.width = `${Math.min(100, confidence * 100)}%`;
+            const confidencePct = Math.round(confidence * 100);
+            confidenceValue.textContent = `${confidencePct}%`;
+            confidenceBar.style.width = `${confidencePct}%`;
 
-            // Update status based on confirmed state
+            // Update status
             statusRing.className = 'status-ring';
             
             if (confirmedState) {
