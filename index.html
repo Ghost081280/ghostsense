@@ -311,7 +311,7 @@
                 </div>
             </div>
             <div class="metric infrasound-metric">
-                <div class="metric-label">INFRASOUND (Breathing)</div>
+                <div class="metric-label">LOW FREQ (20-200Hz)</div>
                 <div class="metric-value" id="infraValue">0.00</div>
                 <div class="metric-bar">
                     <div class="metric-bar-fill" id="infraBar" style="width: 0%"></div>
@@ -342,10 +342,11 @@
         </div>
 
         <div class="info">
-            <strong>Three invisible signals, one laptop:</strong><br><br>
-            🦇 <strong>Ultrasonic (20kHz)</strong> - Echolocation. Speaker emits inaudible tone, mic detects body reflections.<br><br>
-            🫁 <strong>Infrasound (&lt;20Hz)</strong> - Breathing detection. Your breath creates air pressure waves the mic can sense.<br><br>
-            📡 <strong>Network RTT</strong> - WiFi fluctuation. Your body affects signal path to router.
+            <strong>Activity-based presence detection:</strong><br><br>
+            🦇 <strong>Ultrasonic (20kHz)</strong> - Detects changes in sound reflection patterns.<br><br>
+            🫁 <strong>Low Frequency (20-200Hz)</strong> - Room acoustics change when humans are present and moving.<br><br>
+            📡 <strong>Network RTT</strong> - WiFi timing variance from body interference.<br><br>
+            <em>Movement and micro-activity trigger presence. Still = away.</em>
         </div>
     </div>
 
@@ -551,61 +552,52 @@
         function detectPresence() {
             if (!isRunning) return;
 
-            // Get all three signals
+            // Get all signals
             const ultraEnergy = getUltrasonicEnergy();
             const infraEnergy = getInfrasoundEnergy();
             const spectrum = getFullSpectrum();
             
             updateVisualizer(spectrum);
 
-            // Store current readings
+            // Store readings in buffers
             energyBuffer.push(ultraEnergy);
-            if (energyBuffer.length > SMOOTHING_WINDOW) energyBuffer.shift();
-            const smoothedUltra = energyBuffer.reduce((a, b) => a + b, 0) / energyBuffer.length;
+            if (energyBuffer.length > 30) energyBuffer.shift();
 
             infraBuffer.push(infraEnergy);
-            if (infraBuffer.length > SMOOTHING_WINDOW) infraBuffer.shift();
-            const smoothedInfra = infraBuffer.reduce((a, b) => a + b, 0) / infraBuffer.length;
+            if (infraBuffer.length > 30) infraBuffer.shift();
 
-            // Auto-calibrate baselines after collecting enough samples
-            if (calibrationBaseline === null && energyBuffer.length >= SMOOTHING_WINDOW) {
-                calibrationBaseline = smoothedUltra;
-                log('🦇 Ultrasonic baseline: ' + calibrationBaseline.toFixed(4), 'event');
-            }
-            if (infraBaseline === null && infraBuffer.length >= SMOOTHING_WINDOW) {
-                infraBaseline = smoothedInfra;
-                log('🫁 Infrasound baseline: ' + infraBaseline.toFixed(4), 'event');
+            // Calculate VARIANCE - presence = activity/variation in signals
+            let ultraVariance = 0;
+            let infraVariance = 0;
+
+            if (energyBuffer.length > 5) {
+                const ultraAvg = energyBuffer.reduce((a, b) => a + b, 0) / energyBuffer.length;
+                ultraVariance = energyBuffer.reduce((sum, val) => sum + Math.pow(val - ultraAvg, 2), 0) / energyBuffer.length;
             }
 
-            // Calculate scores based on CHANGE from baseline
-            let ultraScore = 0;
-            let infraScore = 0;
-            let networkScore = 0;
-
-            if (calibrationBaseline !== null) {
-                // Ultrasonic: detect change in reflection
-                const ultraChange = Math.abs(smoothedUltra - calibrationBaseline);
-                ultraScore = Math.min(1, ultraChange * 50);
+            if (infraBuffer.length > 5) {
+                const infraAvg = infraBuffer.reduce((a, b) => a + b, 0) / infraBuffer.length;
+                infraVariance = infraBuffer.reduce((sum, val) => sum + Math.pow(val - infraAvg, 2), 0) / infraBuffer.length;
             }
 
-            if (infraBaseline !== null) {
-                // Infrasound: detect ambient sound changes (body absorbs sound)
-                const infraChange = Math.abs(smoothedInfra - infraBaseline);
-                infraScore = Math.min(1, infraChange * 10);
-            }
-
-            // Network: RTT variance indicates movement
+            // Network variance
+            let networkVariance = 0;
             if (rttHistory.length > 3) {
-                const avgRtt = rttHistory.reduce((a, b) => a + b, 0) / rttHistory.length;
-                const rttVariance = rttHistory.reduce((sum, val) => sum + Math.pow(val - avgRtt, 2), 0) / rttHistory.length;
-                networkScore = Math.min(1, Math.sqrt(rttVariance) / 20);
+                const rttAvg = rttHistory.reduce((a, b) => a + b, 0) / rttHistory.length;
+                networkVariance = rttHistory.reduce((sum, val) => sum + Math.pow(val - rttAvg, 2), 0) / rttHistory.length;
             }
 
-            // Combined confidence - any signal can trigger presence
-            const confidence = Math.max(ultraScore, infraScore, networkScore * 0.5);
-            const isPresent = confidence > 0.08;
+            // Convert variance to scores (0-1)
+            // Higher variance = more activity = presence
+            const ultraScore = Math.min(1, ultraVariance * 10000);
+            const infraScore = Math.min(1, infraVariance * 0.5);
+            const networkScore = Math.min(1, networkVariance / 50);
 
-            // Stability logic - faster response
+            // Combined confidence - weight toward infrasound as it seems most active
+            const confidence = (ultraScore * 0.2) + (infraScore * 0.6) + (networkScore * 0.2);
+            const isPresent = confidence > 0.1;
+
+            // Stability logic
             if (confirmedState === null) {
                 confirmedState = isPresent;
                 stabilityCounter = 0;
@@ -614,16 +606,25 @@
                 if (stabilityCounter >= STABILITY_BUFFER) {
                     confirmedState = isPresent;
                     stabilityCounter = 0;
+                    // Log the change with scores
+                    if (confirmedState) {
+                        log(`✓ Present (U:${(ultraScore*100).toFixed(0)}% I:${(infraScore*100).toFixed(0)}% N:${(networkScore*100).toFixed(0)}%)`, 'event');
+                    } else {
+                        log(`✗ Away (U:${(ultraScore*100).toFixed(0)}% I:${(infraScore*100).toFixed(0)}% N:${(networkScore*100).toFixed(0)}%)`, 'warning');
+                    }
                 }
             } else {
                 stabilityCounter = Math.max(0, stabilityCounter - 1);
             }
 
             // Update UI
-            sonarValue.textContent = smoothedUltra.toFixed(4);
+            const currentUltra = energyBuffer[energyBuffer.length - 1] || 0;
+            const currentInfra = infraBuffer[infraBuffer.length - 1] || 0;
+            
+            sonarValue.textContent = currentUltra.toFixed(4);
             sonarBar.style.width = `${Math.min(100, ultraScore * 100)}%`;
             
-            infraValue.textContent = smoothedInfra.toFixed(2);
+            infraValue.textContent = currentInfra.toFixed(2);
             infraBar.style.width = `${Math.min(100, infraScore * 100)}%`;
 
             const confidencePct = Math.round(confidence * 100);
@@ -637,20 +638,10 @@
                 statusRing.classList.add('present');
                 statusIcon.textContent = '👤';
                 statusText.textContent = 'PRESENT';
-                
-                if (lastPresenceState !== true) {
-                    log('✓ Human presence detected', 'event');
-                    lastPresenceState = true;
-                }
             } else {
                 statusRing.classList.add('away');
                 statusIcon.textContent = '👻';
                 statusText.textContent = 'AWAY';
-                
-                if (lastPresenceState !== false) {
-                    log('✗ No presence detected', 'warning');
-                    lastPresenceState = false;
-                }
             }
         }
 
@@ -670,11 +661,10 @@
                 log('Detection stopped');
                 
                 // Reset state
-                calibrationBaseline = null;
-                infraBaseline = null;
                 confirmedState = null;
                 energyBuffer = [];
                 infraBuffer = [];
+                rttHistory = [];
                 return;
             }
 
@@ -689,12 +679,11 @@
                 startBtn.textContent = 'Stop Detection';
                 startBtn.disabled = false;
                 statusRing.className = 'status-ring detecting';
-                statusText.textContent = 'CALIBRATING';
+                statusText.textContent = 'SENSING';
                 statusIcon.textContent = '📡';
                 sonarPulse.classList.remove('hidden');
                 
-                log('Initializing sensors...', 'event');
-                log('Auto-calibrating (stay still for 3 sec)...', 'warning');
+                log('🔊 Sensors active - detecting activity...', 'event');
                 
                 // Start detection loop
                 detectionLoop = setInterval(detectPresence, 50);
